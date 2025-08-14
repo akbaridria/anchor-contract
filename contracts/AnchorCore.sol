@@ -25,7 +25,7 @@ contract AnchorCore is UniversalContract {
         CREATE_OPTIONS,
         ADD_LIQUIDITY,
         REMOVE_LIQUIDITY,
-        RESOLVE_OPTIONS
+        CLAIM_REWARD
     }
 
     struct Options {
@@ -39,9 +39,11 @@ contract AnchorCore is UniversalContract {
         uint256 createdAt;
         uint256 expiry;
         bool isResolved;
+        uint256 payout;
     }
 
     uint256 constant RESOLVER_FEE = 100; // 1%
+    uint256 constant PREMIUM_PER_SIZE = 100_000_000;
 
     uint256 optionId;
 
@@ -52,6 +54,7 @@ contract AnchorCore is UniversalContract {
     error InsufficientLiquidity();
     error OptionsNotExpiredOrResolved();
     error OptionDoesNotExist();
+    error InsufficientBalance();
 
     modifier onlyGateway() {
         if (msg.sender != address(gateway)) revert Unauthorized();
@@ -75,6 +78,12 @@ contract AnchorCore is UniversalContract {
         }
     }
 
+    function createOptions(bytes[] calldata priceUpdateData, uint256 premium, uint256 size, uint256 strikePrice) external {
+        uint256 minimumPremium = _calculatePremium(size);
+        if (premium < minimumPremium) revert InsufficientBalance();
+        usdc.transferFrom(msg.sender, address(this), premium);
+    }
+
     function _createOptions(bytes memory data) internal {
         (
             OptionType optionType,
@@ -96,7 +105,8 @@ contract AnchorCore is UniversalContract {
             buyer: buyer,
             createdAt: block.timestamp,
             expiry: expiry,
-            isResolved: false
+            isResolved: false,
+            payout: 0
         });
         detailOptions[optionId] = options;
         userOptionIds[buyer].push(optionId);
@@ -117,7 +127,7 @@ contract AnchorCore is UniversalContract {
         if (amount > availLiquidity) revert InsufficientLiquidity();
         liquidityManager.removeLiquidity(user, amount);
     }
-
+    // TODO revamp this, it should be resolve only on zetachain.
     function _resolveOptions(bytes memory data, address zrc20) internal {
         (uint256 id, address resolver, uint256 currentPrice, address destinationAddress) =
             abi.decode(data, (uint256, address, uint256, address));
@@ -138,10 +148,11 @@ contract AnchorCore is UniversalContract {
             _calculateIntrinsicValue(options.optionType, options.strikePrice, currentPrice, options.size);
         uint256 resolverFee = _calculateResolverFee(options.premium);
         liquidityManager.unlockLiquidity(options.maxPayout);
+        uint256 payout = options.maxPayout < intrinsicValue ? options.maxPayout : intrinsicValue;
+        options.payout = payout;
 
-        if (intrinsicValue == 0) {}
         // send message to the connected chain with the amount for the resolver
-        // and the amount for the user if win.
+        // and set the amount of the user if user win
     }
 
     function _sendMessageWithReward() internal {}
@@ -171,5 +182,9 @@ contract AnchorCore is UniversalContract {
         // size has 3 decimals (1e3), currentPrice has 8 decimals (1e8), USDC has 6 decimals (1e6)
         // Formula: (size * currentPrice) / (1e3 * 1e8 / 1e6) = (size * currentPrice) / 1e5
         return (size * currentPrice) / 1e5;
+    }
+
+    function _calculatePremium(uint256 size) internal pure returns (uint256) {
+        return (size * PREMIUM_PER_SIZE) / 1e3;
     }
 }

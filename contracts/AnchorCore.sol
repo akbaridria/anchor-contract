@@ -2,19 +2,17 @@
 pragma solidity 0.8.26;
 
 import "@zetachain/protocol-contracts/contracts/zevm/GatewayZEVM.sol";
+import "@zetachain/protocol-contracts/contracts/zevm/interfaces/IZRC20.sol";
+import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
+import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 import "./MockUSDC.sol";
 import "./LiquidityManager.sol";
-
-// this is the core contract that will be deployed on zeta-chain
-// since we need huge number of usdc for options trading, we will use a mock usdc contract
-// thats why we need another contract that will be deployed on connected chain
-// and we call it AnchorClient contract
-// in real scenario, only this contract that we will be deployed.
 
 contract AnchorCore is UniversalContract {
     GatewayZEVM public immutable gateway;
     LiquidityManager public immutable liquidityManager;
     MockUSDC public immutable usdc;
+    IPyth public immutable pyth;
 
     enum OptionType {
         CALL,
@@ -42,29 +40,68 @@ contract AnchorCore is UniversalContract {
         uint256 payout;
     }
 
+    bytes32 constant BTC_PRICE_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
+
     uint256 constant RESOLVER_FEE = 100; // 1%
+    uint256 constant PLATFORM_FEE = 100; // 1%
     uint256 constant PREMIUM_PER_SIZE = 100_000_000;
+    uint256 constant DEFAULT_GAS_LIMIT = 3_000_000;
 
     uint256 optionId;
 
     mapping(uint256 => Options) public detailOptions;
     mapping(address => uint256[]) public userOptionIds;
 
+    event OptionCreated(
+        uint256 optionId, address buyer, uint256 premium, uint256 strikePrice, uint256 size, uint256 expiry
+    );
+    event LiquidityAdded(uint256 amount, address provider);
+    event LiquidityRemoved(uint256 amount, address provider);
+    event OptionsResolved(uint256 optionId, uint256 payout, address resolver);
+    event RewardClaimed(uint256 optionId, uint256 payout, address user);
+
     error Unauthorized();
     error InsufficientLiquidity();
     error OptionsNotExpiredOrResolved();
     error OptionDoesNotExist();
     error InsufficientBalance();
+    error OptionsExpiryLessThanCurrent();
+    error InvalidStrikePrice();
 
     modifier onlyGateway() {
         if (msg.sender != address(gateway)) revert Unauthorized();
         _;
     }
 
-    constructor(address payable _gatewayAddress, address _liquidityManagerAddress, address _usdcAddress) {
+    modifier checkStrikePrice(uint256 strikePrice, uint256 currentPrice, OptionType optionType) {
+        if (optionType == OptionType.CALL && strikePrice < currentPrice) {
+            revert InvalidStrikePrice();
+        } else if (optionType == OptionType.PUT && strikePrice > currentPrice) {
+            revert InvalidStrikePrice();
+        }
+        _;
+    }
+
+    modifier checkOptionOwnership(uint256 id, address user) {
+        if (detailOptions[id].buyer != user) revert Unauthorized();
+        _;
+    }
+
+    modifier checkOption(uint256 id) {
+        if (detailOptions[id].buyer == address(0)) revert OptionDoesNotExist();
+        _;
+    }
+
+    constructor(
+        address payable _gatewayAddress,
+        address _liquidityManagerAddress,
+        address _usdcAddress,
+        address _pythAddress
+    ) {
         gateway = GatewayZEVM(_gatewayAddress);
         liquidityManager = LiquidityManager(_liquidityManagerAddress);
         usdc = MockUSDC(_usdcAddress);
+        pyth = IPyth(_pythAddress);
     }
 
     function onCall(MessageContext calldata context, address zrc20, uint256 amount, bytes calldata message)
@@ -76,12 +113,51 @@ contract AnchorCore is UniversalContract {
         if (option == FunctionOptions.CREATE_OPTIONS) {
             _createOptions(data);
         }
+        if (option == FunctionOptions.ADD_LIQUIDITY) {
+            _addLiquidity(data);
+        }
+        if (option == FunctionOptions.REMOVE_LIQUIDITY) {
+            _removeLiquidity(data);
+        }
+        if (option == FunctionOptions.CLAIM_REWARD) {
+            _claimReward(data);
+        }
     }
 
-    function createOptions(bytes[] calldata priceUpdateData, uint256 premium, uint256 size, uint256 strikePrice) external {
+    function createOptions(
+        bytes[] calldata priceUpdateData,
+        OptionType optionType,
+        uint256 expiry,
+        uint256 premium,
+        uint256 size,
+        uint256 strikePrice
+    ) external payable {
         uint256 minimumPremium = _calculatePremium(size);
         if (premium < minimumPremium) revert InsufficientBalance();
+        if (block.timestamp > expiry) revert OptionsExpiryLessThanCurrent();
+
         usdc.transferFrom(msg.sender, address(this), premium);
+
+        uint256 currentPrice = _getBtcPrice(priceUpdateData);
+        bytes memory data = abi.encode(optionType, premium, strikePrice, currentPrice, size, expiry, msg.sender);
+        _createOptions(data);
+    }
+
+    function addLiquidity(uint256 amount) external {
+        bytes memory data = abi.encode(amount, msg.sender);
+        _addLiquidity(data);
+    }
+
+    function removeLiquidity(uint256 amount) external {
+        bytes memory data = abi.encode(amount, msg.sender);
+        _removeLiquidity(data);
+    }
+
+    function _getBtcPrice(bytes[] calldata priceUpdateData) internal returns (uint256) {
+        uint256 fee = pyth.getUpdateFee(priceUpdateData);
+        pyth.updatePriceFeeds{value: fee}(priceUpdateData);
+        PythStructs.Price memory currentPrice = pyth.getPriceNoOlderThan(BTC_PRICE_ID, 30);
+        return uint256(uint64(currentPrice.price));
     }
 
     function _createOptions(bytes memory data) internal {
@@ -110,6 +186,7 @@ contract AnchorCore is UniversalContract {
         });
         detailOptions[optionId] = options;
         userOptionIds[buyer].push(optionId);
+        emit OptionCreated(optionId, buyer, premium, strikePrice, size, expiry);
         optionId++;
 
         usdc.mint(premium);
@@ -119,23 +196,24 @@ contract AnchorCore is UniversalContract {
     function _addLiquidity(bytes memory data) internal {
         (uint256 amount, address user) = abi.decode(data, (uint256, address));
         liquidityManager.addLiquidity(user, amount);
+        emit LiquidityAdded(amount, user);
     }
 
     function _removeLiquidity(bytes memory data) internal {
-        (uint256 amount, address user) = abi.decode(data, (uint256, address));
+        (uint256 amount, address user, address zrc20, address destinationAddress) =
+            abi.decode(data, (uint256, address, address, address));
         uint256 availLiquidity = liquidityManager.getAvailableLiquidity();
         if (amount > availLiquidity) revert InsufficientLiquidity();
         liquidityManager.removeLiquidity(user, amount);
+        bytes memory message = abi.encode(user, amount);
+        _sendMessage(user, zrc20, destinationAddress, message);
+        emit LiquidityRemoved(amount, user);
     }
-    // TODO revamp this, it should be resolve only on zetachain.
-    function _resolveOptions(bytes memory data, address zrc20) internal {
-        (uint256 id, address resolver, uint256 currentPrice, address destinationAddress) =
-            abi.decode(data, (uint256, address, uint256, address));
-        Options storage options = detailOptions[id];
 
-        if (options.buyer == address(0)) {
-            revert OptionDoesNotExist();
-        }
+    function resolveOptions(uint256 id, bytes[] calldata priceUpdateData) external payable checkOption(id) {
+        uint256 currentPrice = _getBtcPrice(priceUpdateData);
+
+        Options storage options = detailOptions[id];
 
         if (options.expiry > block.timestamp || options.isResolved) {
             revert OptionsNotExpiredOrResolved();
@@ -146,16 +224,67 @@ contract AnchorCore is UniversalContract {
         // calculate if user win
         uint256 intrinsicValue =
             _calculateIntrinsicValue(options.optionType, options.strikePrice, currentPrice, options.size);
+        // calculate resolverfee
         uint256 resolverFee = _calculateResolverFee(options.premium);
+        // unlock liquidity
         liquidityManager.unlockLiquidity(options.maxPayout);
+        // calculate realpayout
         uint256 payout = options.maxPayout < intrinsicValue ? options.maxPayout : intrinsicValue;
-        options.payout = payout;
+        options.payout = payout + options.premium - resolverFee;
+        // transfer to resolver as reward
+        usdc.transfer(msg.sender, resolverFee);
 
-        // send message to the connected chain with the amount for the resolver
-        // and set the amount of the user if user win
+        // calculate pnl
+        int256 pnl = _calculatePnl(resolverFee, payout, options.premium);
+        liquidityManager.distributePnL(pnl);
+
+        emit OptionsResolved(id, payout, msg.sender);
     }
 
-    function _sendMessageWithReward() internal {}
+    function claimReward(uint256 id) external checkOption(id) checkOptionOwnership(id, msg.sender) {
+        Options storage options = detailOptions[id];
+        usdc.transfer(msg.sender, options.payout);
+        emit RewardClaimed(id, options.payout, msg.sender);
+    }
+
+    function _claimReward(bytes memory data) internal {
+        (address user, address destinationAddress, address zrc20, uint256 id) =
+            abi.decode(data, (address, address, address, uint256));
+        Options storage options = detailOptions[id];
+        if (options.buyer != user) revert Unauthorized();
+        if (!options.isResolved) revert OptionsNotExpiredOrResolved();
+        bytes memory message = abi.encode(user, options.payout);
+        _sendMessage(user, zrc20, destinationAddress, message);
+        options.payout = 0;
+        emit RewardClaimed(id, options.payout, user);
+    }
+
+    function _sendMessage(address user, address zrc20, address destinationAddress, bytes memory message) internal {
+        CallOptions memory callOptions = CallOptions({gasLimit: DEFAULT_GAS_LIMIT, isArbitraryCall: false});
+
+        RevertOptions memory revertOptions = RevertOptions({
+            revertAddress: user,
+            callOnRevert: false,
+            abortAddress: address(0),
+            revertMessage: "",
+            onRevertGasLimit: 0
+        });
+        (address gasZRC20, uint256 gasFee) = IZRC20(zrc20).withdrawGasFeeWithGasLimit(DEFAULT_GAS_LIMIT);
+        IZRC20(gasZRC20).approve(address(gateway), gasFee);
+        gateway.call(abi.encodePacked(destinationAddress), zrc20, message, callOptions, revertOptions);
+    }
+
+    function _calculatePnl(uint256 resolverFee, uint256 intrinsicValue, uint256 premium)
+        internal
+        pure
+        returns (int256)
+    {
+        if (intrinsicValue == 0) {
+            return int256(premium) - int256(resolverFee);
+        }
+
+        return -int256(intrinsicValue);
+    }
 
     function _calculateResolverFee(uint256 premium) internal pure returns (uint256) {
         return (premium * RESOLVER_FEE) / 1e3;

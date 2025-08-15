@@ -7,6 +7,7 @@ import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 import "./MockUSDC.sol";
 import "./LiquidityManager.sol";
+import "./Types.sol";
 
 contract AnchorCore is UniversalContract {
     GatewayZEVM public immutable gateway;
@@ -14,37 +15,8 @@ contract AnchorCore is UniversalContract {
     MockUSDC public immutable usdc;
     IPyth public immutable pyth;
 
-    enum OptionType {
-        CALL,
-        PUT
-    }
-
-    enum FunctionOptions {
-        CREATE_OPTIONS,
-        ADD_LIQUIDITY,
-        REMOVE_LIQUIDITY,
-        CLAIM_REWARD
-    }
-
-    struct Options {
-        OptionType optionType;
-        uint256 premium;
-        uint256 maxPayout;
-        uint256 strikePrice;
-        uint256 currentPrice;
-        uint256 size;
-        address buyer;
-        uint256 createdAt;
-        uint256 expiry;
-        bool isResolved;
-        uint256 payout;
-    }
-
-    bytes32 constant BTC_PRICE_ID = 0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43;
-
     uint256 constant RESOLVER_FEE = 100; // 1%
     uint256 constant PLATFORM_FEE = 100; // 1%
-    uint256 constant PREMIUM_PER_SIZE = 100_000_000;
     uint256 constant DEFAULT_GAS_LIMIT = 3_000_000;
 
     uint256 optionId;
@@ -316,4 +288,7 @@ contract AnchorCore is UniversalContract {
     function _calculatePremium(uint256 size) internal pure returns (uint256) {
         return (size * PREMIUM_PER_SIZE) / 1e3;
     }
+
+    receive() external payable {}
+    fallback() external payable {}
 }

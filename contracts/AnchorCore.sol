@@ -64,14 +64,9 @@ contract AnchorCore is UniversalContract {
         _;
     }
 
-    constructor(
-        address payable _gatewayAddress,
-        address _liquidityManagerAddress,
-        address _usdcAddress,
-        address _pythAddress
-    ) {
+    constructor(address payable _gatewayAddress, address _usdcAddress, address _pythAddress) {
         gateway = GatewayZEVM(_gatewayAddress);
-        liquidityManager = LiquidityManager(_liquidityManagerAddress);
+        liquidityManager = new LiquidityManager();
         usdc = MockUSDC(_usdcAddress);
         pyth = IPyth(_pythAddress);
     }
@@ -83,7 +78,7 @@ contract AnchorCore is UniversalContract {
     {
         (FunctionOptions option, bytes memory data) = abi.decode(message, (FunctionOptions, bytes));
         if (option == FunctionOptions.CREATE_OPTIONS) {
-            _createOptions(data);
+            _createOptions(data, true);
         }
         if (option == FunctionOptions.ADD_LIQUIDITY) {
             _addLiquidity(data);
@@ -112,7 +107,7 @@ contract AnchorCore is UniversalContract {
 
         uint256 currentPrice = _getBtcPrice(priceUpdateData);
         bytes memory data = abi.encode(optionType, premium, strikePrice, currentPrice, size, expiry, msg.sender);
-        _createOptions(data);
+        _createOptions(data, false);
     }
 
     function addLiquidity(uint256 amount) external {
@@ -132,7 +127,7 @@ contract AnchorCore is UniversalContract {
         return uint256(uint64(currentPrice.price));
     }
 
-    function _createOptions(bytes memory data) internal {
+    function _createOptions(bytes memory data, bool isCrossChain) internal {
         (
             OptionType optionType,
             uint256 premium,
@@ -142,7 +137,7 @@ contract AnchorCore is UniversalContract {
             uint256 expiry,
             address buyer
         ) = abi.decode(data, (OptionType, uint256, uint256, uint256, uint256, uint256, address));
-        uint256 maxPayout = _calculateMaxPayout(size, currentPrice);
+        uint256 maxPayout = _calculateMaxPayout(size, currentPrice, strikePrice);
         Options memory options = Options({
             optionType: optionType,
             premium: premium,
@@ -161,7 +156,9 @@ contract AnchorCore is UniversalContract {
         emit OptionCreated(optionId, buyer, premium, strikePrice, size, expiry);
         optionId++;
 
-        usdc.mint(premium);
+        if (isCrossChain) {
+            usdc.mint(premium);
+        }
         liquidityManager.lockLiquidity(maxPayout);
     }
 
@@ -278,15 +275,28 @@ contract AnchorCore is UniversalContract {
         return (diff * size) / 1e5;
     }
 
-    function _calculateMaxPayout(uint256 size, uint256 currentPrice) internal pure returns (uint256) {
-        // Calculate max payout in USDC (6 decimals)
-        // size has 3 decimals (1e3), currentPrice has 8 decimals (1e8), USDC has 6 decimals (1e6)
-        // Formula: (size * currentPrice) / (1e3 * 1e8 / 1e6) = (size * currentPrice) / 1e5
-        return (size * currentPrice) / 1e5;
+    function _calculateMaxPayout(uint256 size, uint256 currentPrice, uint256 strikePrice)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (currentPrice > strikePrice) {
+            // PUT options
+            return (size * (currentPrice - strikePrice)) / 1e5;
+        }
+        return (size * (strikePrice - currentPrice)) / 1e5;
     }
 
     function _calculatePremium(uint256 size) internal pure returns (uint256) {
         return (size * PREMIUM_PER_SIZE) / 1e3;
+    }
+
+    function getTotalLiquidity() external view returns (uint256, uint256) {
+        return (liquidityManager.getTotalLiquidity(), liquidityManager.getAvailableLiquidity());
+    }
+
+    function getProviderBalance(address _user) external view returns (uint256) {
+        return liquidityManager.getProviderBalance(_user);
     }
 
     receive() external payable {}

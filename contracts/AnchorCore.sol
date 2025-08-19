@@ -71,7 +71,7 @@ contract AnchorCore is UniversalContract {
         pyth = IPyth(_pythAddress);
     }
 
-    function onCall(MessageContext calldata context, address zrc20, uint256 amount, bytes calldata message)
+    function onCall(MessageContext calldata, address, uint256, bytes calldata message)
         external
         override
         onlyGateway
